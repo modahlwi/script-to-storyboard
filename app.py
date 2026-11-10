@@ -3,11 +3,12 @@ script-to-storyboard
 --------------------
 Paste a screenplay (standard slugline format) or plain prose and get:
   1. a machine readable shot list
-  2. a generated storyboard panel for every shot
+  2. a storyboard panel for every shot, streamed as they are rendered
   3. a CSV you can hand to a director or import into a shot tracker
 
 Run the UI:      python app.py
 Shot list only:  python app.py --dry-run sample_script.txt
+Diagnose setup:  python app.py --check
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ TRANSITION = re.compile(
     r"DISSOLVE TO:|MATCH CUT TO:|THE END)",
     re.I,
 )
-CHARACTER_CUE = re.compile(r"^[A-Z][A-Z\s0-9\-']{1,39}$")
+CHARACTER_CUE = re.compile(r"^[A-Z][A-Z\s0-9\-']{1,39}(\s*\([^)]*\))?$")
 NAME = re.compile(r"\b([A-Z][A-Z]{2,})\b")
 CAMERA_PREFIX = re.compile(
     r"^(CLOSE ON|CLOSE UP|INSERT OF|WIDE ON|POV|ON|OVER THE SHOULDERS? OF)\s*[-:,]?\s*", re.I
@@ -75,8 +76,8 @@ def parse_screenplay(text: str) -> list[Scene]:
             scenes.append(current)
 
         if CHARACTER_CUE.match(line) and not line.endswith("."):
-            speaker = line
-            current.speakers.add(line)
+            speaker = re.sub(r"\s*\([^)]*\)$", "", line)
+            current.speakers.add(speaker)
             continue
 
         if line.startswith("("):  # parenthetical delivery note, e.g. (quietly)
@@ -176,8 +177,10 @@ def build_shots(script: str, style: str, negative: str) -> list[dict]:
 
 # ------------------------------------------------------------------ 4. render
 MODELS = {
-    "SD 1.5 (runs on CPU)": "stable-diffusion-v1-5/stable-diffusion-v1-5",
-    "SDXL (GPU recommended)": "stabilityai/stable-diffusion-xl-base-1.0",
+    "Local SD 1.5 (CPU friendly)": "stable-diffusion-v1-5/stable-diffusion-v1-5",
+    "Local SDXL (needs a GPU)": "stabilityai/stable-diffusion-xl-base-1.0",
+    "Hosted API (no local install)": "stable-diffusion-v1-5/stable-diffusion-v1-5",
+    "Placeholder only (no model at all)": None,
 }
 STYLES = {
     "storyboard sketch": "loose pencil and ink storyboard panel, flat muted color wash, white paper background",
@@ -185,26 +188,56 @@ STYLES = {
     "blueprint line art": "black and white architectural line drawing, technical storyboard board",
     "anime cel": "anime cel shading, clean linework, expressive characters",
 }
-SIZES = {"16:9": (768, 432), "21:9": (768, 328), "1:1": (768, 768), "9:16": (432, 768)}
+SIZES = {
+    "small": {"16:9": (512, 288), "21:9": (512, 216), "1:1": (512, 512), "9:16": (288, 512)},
+    "large": {"16:9": (1024, 576), "21:9": (1024, 440), "1:1": (1024, 1024), "9:16": (576, 1024)},
+}
 
 _pipelines: dict[str, object] = {}
+_client = None
 
 
-def pipeline(model_id: str):
+def device_info() -> str:
+    try:
+        import torch
+
+        return f"torch {torch.__version__} · device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
+    except Exception as exc:
+        return f"torch unavailable: {exc}"
+
+
+def sized(model_key: str, aspect: str) -> tuple[int, int]:
+    return SIZES["large" if model_key == "Local SDXL (needs a GPU)" else "small"][aspect]
+
+
+def local_pipeline(model_id: str):
     if model_id not in _pipelines:
         import torch
         from diffusers import StableDiffusionPipeline
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
+        print(f"Loading {model_id} on {device} ... this can take a few minutes the first time")
         _pipelines[model_id] = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype).to(device)
     return _pipelines[model_id]
 
 
-def render(prompt: str, negative: str, size: tuple[int, int], steps: int, seed: int, model_id: str):
+def render(prompt: str, negative: str, size: tuple[int, int], steps: int, seed: int, model_key: str):
+    model_id = MODELS[model_key]
+
+    if model_key == "Hosted API (no local install)":
+        global _client
+        if _client is None:
+            from huggingface_hub import InferenceClient
+
+            _client = InferenceClient(model=model_id)  # needs HF_TOKEN in the environment
+        return _client.image_generation(
+            prompt, width=size[0], height=size[1], negative_prompt=negative, num_inference_steps=int(steps)
+        )
+
+    pipe = local_pipeline(model_id)
     import torch
 
-    pipe = pipeline(model_id)
     generator = torch.Generator(pipe.device).manual_seed(int(seed))
     return pipe(
         prompt=prompt,
@@ -217,36 +250,83 @@ def render(prompt: str, negative: str, size: tuple[int, int], steps: int, seed: 
     ).images[0]
 
 
-def generate(
-    script: str,
-    style: str,
-    model: str,
-    steps: int,
-    aspect: str,
-    seed: int,
-    out_dir: str = "storyboard",
-):
-    shots = build_shots(script, STYLES[style], "blurry, text, watermark, deformed hands")
-    os.makedirs(out_dir, exist_ok=True)
-    size = SIZES[aspect]
+def wrap(text: str, width: int = 60) -> list[str]:
+    lines, current = [], ""
+    for word in text.split():
+        if len(current) + len(word) + 1 > width:
+            lines.append(current)
+            current = word
+        else:
+            current = (current + " " + word).strip()
+    if current:
+        lines.append(current)
+    return lines or [""]
 
+
+def placeholder_panel(shot: dict, size: tuple[int, int]):
+    """A drawn storyboard board, so the sequence is complete even with no image model."""
+    from PIL import Image, ImageDraw
+
+    try:
+        from PIL import ImageFont
+
+        font = ImageFont.truetype("DejaVuSans.ttf", 22)
+        small = ImageFont.truetype("DejaVuSans.ttf", 14)
+    except Exception:
+        font = small = ImageFont.load_default()
+
+    image = Image.new("RGB", size, (248, 246, 240))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([0, 0, size[0] - 1, size[1] - 1], outline=(70, 70, 70))
+    draw.rectangle([0, 0, size[0] - 1, 46], outline=(70, 70, 70))
+    draw.text((12, 14), f"SHOT {shot['no']:03d} - {shot['type']}", fill=(20, 20, 20), font=font)
+
+    y = 60
+    for line in wrap(shot["action"], 70)[:8]:
+        draw.text((12, y), line, fill=(40, 40, 40), font=small)
+        y += 20
+    draw.text((12, size[1] - 24), "placeholder panel - image model unavailable", fill=(120, 120, 120), font=small)
+    return image
+
+
+def generate(script: str, style: str, model: str, steps: int, aspect: str, seed: int, out_dir: str = "storyboard"):
+    shots = build_shots(script, STYLES[style], "blurry, text, watermark, deformed hands")
+    if not shots:
+        yield [], [], "No scenes or action lines found in the script. Check the slugline format (INT./EXT. LOCATION - TIME)."
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+    size = sized(model, aspect)
+    progress = gr.Progress()
     images, rows = [], []
+    status = f"Rendering {len(shots)} panels · {device_info()}"
+
     for shot in shots:
-        image = render(
-            shot["prompt"], shot["negative"], size, steps, int(seed) + shot["no"], MODELS[model]
-        )
+        progress(shot["no"] / len(shots), desc=f"Panel {shot['no']} of {len(shots)}")
+        error = ""
+        try:
+            if model == "Placeholder only (no model at all)":
+                image = placeholder_panel(shot, size)
+            else:
+                image = render(shot["prompt"], shot["negative"], size, steps, int(seed) + shot["no"], model)
+        except Exception as exc:
+            image = placeholder_panel(shot, size)
+            error = f"{type(exc).__name__}: {exc}"
+            status = f"Image model failed ({error}). Falling back to drawn placeholder panels."
+
         path = os.path.join(out_dir, f"shot_{shot['no']:03d}.png")
         image.save(path)
         images.append(image)
         rows.append(
-            [shot["no"], shot["scene"], shot["type"], shot["action"], shot["characters"], shot["prompt"], path]
+            [shot["no"], shot["scene"], shot["type"], shot["action"], shot["characters"], shot["prompt"], path, error]
         )
+        yield images, rows, status
 
     with open(os.path.join(out_dir, "storyboard.csv"), "w", newline="", encoding="utf-8") as handle:
         csv.writer(handle).writerows(
-            [["shot", "scene", "shot_type", "action", "characters", "prompt", "image"]] + rows
+            [["shot", "scene", "shot_type", "action", "characters", "prompt", "image", "error"]] + rows
         )
-    return images, rows
+    yield images, rows, f"Done: {len(images)} panels written to {out_dir}/ and {out_dir}/storyboard.csv"
 
 
 def shot_list(script: str, style: str):
@@ -261,36 +341,39 @@ demo = gr.Blocks(title="Script to Storyboard")
 with demo:
     gr.Markdown(
         "Paste a screenplay (standard slugline format) or plain prose. "
-        "Preview the shot list first, then generate the panels."
+        "Preview the shot list first, then generate the panels. "
+        "Panels appear one at a time; if the image model cannot load you still get drawn placeholder boards."
     )
     script = gr.Textbox(label="Script", lines=15, value=SAMPLE)
     with gr.Row():
         style = gr.Dropdown(list(STYLES), value="storyboard sketch", label="Style")
-        model = gr.Dropdown(list(MODELS), value="SD 1.5 (runs on CPU)", label="Model")
-        aspect = gr.Dropdown(list(SIZES), value="16:9", label="Aspect ratio")
+        model = gr.Dropdown(list(MODELS), value="Local SD 1.5 (CPU friendly)", label="Backend")
+        aspect = gr.Dropdown(list(SIZES["small"]), value="16:9", label="Aspect ratio")
         steps = gr.Slider(10, 40, value=20, label="Steps")
         seed = gr.Number(value=1337, label="Base seed")
+
+    status = gr.Textbox(label="Status", value=device_info())
 
     gr.Button("Preview shot list", variant="secondary").click(
         lambda s, st: shot_list(s, st),
         [script, style],
         gr.Dataframe(["shot", "scene", "type", "action"]),
     )
-    gr.Button("Generate storyboard").click(
+    gr.Button("Generate storyboard", variant="primary").click(
         lambda s, st, m, n, a, sd: generate(s, st, m, n, a, sd),
         [script, style, model, steps, aspect, seed],
         [
             gr.Gallery(columns=4),
-            gr.Dataframe(["shot", "scene", "type", "action", "characters", "prompt", "image"]),
+            gr.Dataframe(["shot", "scene", "type", "action", "characters", "prompt", "image", "error"]),
+            status,
         ],
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dry-run", metavar="SCRIPT", help="print the shot list and exit without generating images"
-    )
+    parser.add_argument("--dry-run", metavar="SCRIPT", help="print the shot list and exit without generating images")
+    parser.add_argument("--check", action="store_true", help="print device info and try loading the model once")
     parser.add_argument("--style", default="storyboard sketch")
     args = parser.parse_args()
 
@@ -298,6 +381,15 @@ if __name__ == "__main__":
         with open(args.dry_run, encoding="utf-8") as handle:
             for shot in build_shots(handle.read(), STYLES[args.style], ""):
                 print(f"{shot['no']:>3}  scene {shot['scene']}  {shot['type']:<24}  {shot['action']}")
+        sys.exit(0)
+
+    if args.check:
+        print(device_info())
+        try:
+            image = render("a lighthouse at night, storyboard sketch", "", (512, 288), 10, 1, "Local SD 1.5 (CPU friendly)")
+            print(f"Model loaded OK, produced a {image.size} image.")
+        except Exception as exc:
+            print(f"Could not load the model: {exc}")
         sys.exit(0)
 
     demo.launch()
