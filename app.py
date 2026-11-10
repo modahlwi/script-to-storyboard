@@ -23,7 +23,11 @@ import gradio as gr
 
 # ---------------------------------------------------------------------- 1. parse
 SLUG = re.compile(r"^(INT\.|EXT\.|INT\./EXT\.|EXT/INT\.)\s*(.+?)(?:\s+-\s+(.+))?$", re.I)
-TRANSITION = re.compile(r"^(CUT TO:|FADE (OUT|IN)[:.]?|SMASH CUT TO:|DISSOLVE TO:|MATCH CUT TO:)")
+TRANSITION = re.compile(
+    r"^(CUT TO:|CUT TO BLACK|FADE (OUT|IN)[:.]?|FADE TO BLACK|SMASH CUT TO:|"
+    r"DISSOLVE TO:|MATCH CUT TO:|THE END)",
+    re.I,
+)
 CHARACTER_CUE = re.compile(r"^[A-Z][A-Z\s0-9\-']{1,39}$")
 NAME = re.compile(r"\b([A-Z][A-Z]{2,})\b")
 CAMERA_PREFIX = re.compile(
@@ -41,6 +45,7 @@ class Scene:
     time: str
     interior: str
     beats: list = field(default_factory=list)
+    speakers: set = field(default_factory=set)
 
 
 def parse_screenplay(text: str) -> list[Scene]:
@@ -71,8 +76,7 @@ def parse_screenplay(text: str) -> list[Scene]:
 
         if CHARACTER_CUE.match(line) and not line.endswith("."):
             speaker = line
-            current.registry.setdefault if False else None
-            people_seen.add(line)
+            current.speakers.add(line)
             continue
 
         if line.startswith("("):  # parenthetical delivery note, e.g. (quietly)
@@ -118,7 +122,10 @@ def classify(beat: dict, index: int) -> str:
 def character_registry(scenes: list[Scene]) -> dict[str, str]:
     """Remember each character and how they were first described, so panels stay consistent."""
     people: dict[str, str] = {}
+
     for scene in scenes:
+        for speaker in scene.speakers:
+            people.setdefault(speaker, "")
         for beat in scene["beats"]:
             for name in NAME.findall(beat["line"]):
                 if name in STOP:
@@ -210,18 +217,30 @@ def render(prompt: str, negative: str, size: tuple[int, int], steps: int, seed: 
     ).images[0]
 
 
-def generate(script: str, style: str, model: str, steps: int, aspect: str, seed: int, out_dir: str = "storyboard"):
+def generate(
+    script: str,
+    style: str,
+    model: str,
+    steps: int,
+    aspect: str,
+    seed: int,
+    out_dir: str = "storyboard",
+):
     shots = build_shots(script, STYLES[style], "blurry, text, watermark, deformed hands")
     os.makedirs(out_dir, exist_ok=True)
     size = SIZES[aspect]
 
     images, rows = [], []
     for shot in shots:
-        image = render(shot["prompt"], shot["negative"], size, steps, int(seed) + shot["no"], MODELS[model])
+        image = render(
+            shot["prompt"], shot["negative"], size, steps, int(seed) + shot["no"], MODELS[model]
+        )
         path = os.path.join(out_dir, f"shot_{shot['no']:03d}.png")
         image.save(path)
         images.append(image)
-        rows.append([shot["no"], shot["scene"], shot["type"], shot["action"], shot["characters"], shot["prompt"], path])
+        rows.append(
+            [shot["no"], shot["scene"], shot["type"], shot["action"], shot["characters"], shot["prompt"], path]
+        )
 
     with open(os.path.join(out_dir, "storyboard.csv"), "w", newline="", encoding="utf-8") as handle:
         csv.writer(handle).writerows(
@@ -235,6 +254,8 @@ def shot_list(script: str, style: str):
 
 
 # ---------------------------------------------------------------- Gradio UI
+SAMPLE = open("sample_script.txt", encoding="utf-8").read() if os.path.exists("sample_script.txt") else ""
+
 demo = gr.Blocks(title="Script to Storyboard")
 
 with demo:
@@ -242,7 +263,7 @@ with demo:
         "Paste a screenplay (standard slugline format) or plain prose. "
         "Preview the shot list first, then generate the panels."
     )
-    script = gr.Textbox(label="Script", lines=15, value=open("sample_script.txt", encoding="utf-8").read() if os.path.exists("sample_script.txt") else "")
+    script = gr.Textbox(label="Script", lines=15, value=SAMPLE)
     with gr.Row():
         style = gr.Dropdown(list(STYLES), value="storyboard sketch", label="Style")
         model = gr.Dropdown(list(MODELS), value="SD 1.5 (runs on CPU)", label="Model")
@@ -251,18 +272,25 @@ with demo:
         seed = gr.Number(value=1337, label="Base seed")
 
     gr.Button("Preview shot list", variant="secondary").click(
-        lambda s, st: shot_list(s, st), [script, style], gr.Dataframe(["shot", "scene", "type", "action"])
+        lambda s, st: shot_list(s, st),
+        [script, style],
+        gr.Dataframe(["shot", "scene", "type", "action"]),
     )
     gr.Button("Generate storyboard").click(
         lambda s, st, m, n, a, sd: generate(s, st, m, n, a, sd),
         [script, style, model, steps, aspect, seed],
-        [gr.Gallery(columns=4), gr.Dataframe(["shot", "scene", "type", "action", "characters", "prompt", "image"])],
+        [
+            gr.Gallery(columns=4),
+            gr.Dataframe(["shot", "scene", "type", "action", "characters", "prompt", "image"]),
+        ],
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", metavar="SCRIPT", help="print the shot list and exit without generating images")
+    parser.add_argument(
+        "--dry-run", metavar="SCRIPT", help="print the shot list and exit without generating images"
+    )
     parser.add_argument("--style", default="storyboard sketch")
     args = parser.parse_args()
 
