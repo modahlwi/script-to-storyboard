@@ -1,0 +1,4 @@
+gradio>=4.0
+diffusers>=0.25
+torch>=2.1
+pillow>=10.0
