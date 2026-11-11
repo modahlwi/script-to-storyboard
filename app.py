@@ -9,6 +9,9 @@ Paste a screenplay (standard slugline format) or plain prose and get:
 Run the UI:      python app.py
 Shot list only:  python app.py --dry-run sample_script.txt
 Diagnose setup:  python app.py --check
+Use a locally downloaded model:
+    hf download stable-diffusion-v1-5/stable-diffusion-v1-5 --local-dir models/sd1.5
+    python app.py --model-dir models/sd1.5
 """
 from __future__ import annotations
 
@@ -176,10 +179,13 @@ def build_shots(script: str, style: str, negative: str) -> list[dict]:
 
 
 # ------------------------------------------------------------------ 4. render
+DEFAULT_MODEL = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+XL_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
+
 MODELS = {
-    "Local SD 1.5 (CPU friendly)": "stable-diffusion-v1-5/stable-diffusion-v1-5",
-    "Local SDXL (needs a GPU)": "stabilityai/stable-diffusion-xl-base-1.0",
-    "Hosted API (no local install)": "stable-diffusion-v1-5/stable-diffusion-v1-5",
+    "Local SD 1.5 (CPU friendly)": DEFAULT_MODEL,
+    "Local SDXL (needs a GPU)": XL_MODEL,
+    "Hosted API (no local install)": DEFAULT_MODEL,
     "Placeholder only (no model at all)": None,
 }
 STYLES = {
@@ -197,11 +203,17 @@ _pipelines: dict[str, object] = {}
 _client = None
 
 
+def model_path(model_id: str) -> str:
+    """A manually downloaded model folder wins over the Hub id."""
+    return os.environ.get("SD_MODEL_DIR") or model_id
+
+
 def device_info() -> str:
     try:
         import torch
 
-        return f"torch {torch.__version__} · device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        return f"torch {torch.__version__} · device: {device} · model: {os.environ.get('SD_MODEL_DIR') or 'Hugging Face Hub'}"
     except Exception as exc:
         return f"torch unavailable: {exc}"
 
@@ -217,8 +229,11 @@ def local_pipeline(model_id: str):
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
-        print(f"Loading {model_id} on {device} ... this can take a few minutes the first time")
-        _pipelines[model_id] = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype).to(device)
+        path = model_path(model_id)
+        print(f"Loading {path} on {device} ... first run downloads ~4.3 GB into the HF cache")
+        _pipelines[model_id] = StableDiffusionPipeline.from_pretrained(
+            path, torch_dtype=dtype, safety_checker=None
+        ).to(device)
     return _pipelines[model_id]
 
 
@@ -342,7 +357,8 @@ with demo:
     gr.Markdown(
         "Paste a screenplay (standard slugline format) or plain prose. "
         "Preview the shot list first, then generate the panels. "
-        "Panels appear one at a time; if the image model cannot load you still get drawn placeholder boards."
+        "Panels appear one at a time; if the image model cannot load you still get drawn placeholder boards. "
+        "Pass `--model-dir` to use a model you downloaded by hand."
     )
     script = gr.Textbox(label="Script", lines=15, value=SAMPLE)
     with gr.Row():
@@ -374,8 +390,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", metavar="SCRIPT", help="print the shot list and exit without generating images")
     parser.add_argument("--check", action="store_true", help="print device info and try loading the model once")
+    parser.add_argument(
+        "--model-dir",
+        help="path to a model folder you downloaded manually, e.g. models/sd1.5",
+    )
     parser.add_argument("--style", default="storyboard sketch")
     args = parser.parse_args()
+
+    if args.model_dir:
+        os.environ["SD_MODEL_DIR"] = args.model_dir
 
     if args.dry_run:
         with open(args.dry_run, encoding="utf-8") as handle:
